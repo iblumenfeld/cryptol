@@ -26,23 +26,12 @@ import System.IO
 import System.Exit
 import System.FilePath (takeExtension)
 
-codeGen :: Maybe FilePath -> GenerationRoot -> GenerationTarget -> IO ()
-codeGen dir root impl = inFreshEnv $
+codeGen :: Maybe FilePath -> GenerationRoot -> GenerationTarget -> ModuleM ()
+codeGen dir root impl =
   do root' <- checkRoot root
      case impl of
        SBVC -> SBVC.codeGen dir root'
        _    -> fail "This backend is not yet implemented"
-
-inFreshEnv :: ModuleM () -> IO ()
-inFreshEnv body =
-  do env         <- initialModuleEnv
-     (res,warns) <- runModuleM env body
-     mapM_ (print . pp) warns
-     case res of
-       Right (a,_) ->    return ()
-       Left err    -> do print (pp err)
-                         exitFailure
-
 
 -- | Check a generation target, resolving identifiers, module names and
 -- directories.

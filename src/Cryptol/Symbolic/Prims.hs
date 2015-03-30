@@ -278,7 +278,7 @@ selectV f v = sel 0 bits
       where m1 = sel (offset + 2 ^ length bs) bs
             m2 = sel offset bs
 
-replicateV :: Integer -> Value -> Value
+replicateV :: Integer -> GenValue b w -> GenValue b w
 replicateV n x = VSeq False (genericReplicate n x)
 
 nth :: a -> [a] -> Int -> a

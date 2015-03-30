@@ -1,3 +1,5 @@
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE RecordWildCards #-}
 -- |
 -- Module      :  $Header$
 -- Copyright   :  (c) 2014-2015 Galois, Inc.
@@ -10,14 +12,17 @@ module Main where
 
 import CodeGen
 import Cryptol.ModuleSystem (loadModuleByPath, initialModuleEnv)
-import Cryptol.ModuleSystem.Env (moduleDeps)
+import Cryptol.ModuleSystem.Env (moduleDeps,ModuleEnv(..))
+import Cryptol.ModuleSystem.Monad (runModuleM, ModuleM, io, modifyModuleEnv)
 import Cryptol.Utils.PP (pp)
 import Data.Char (toLower)
 import Data.List (intercalate)
 import Data.String (fromString)
 import Options
 import System.Directory (doesFileExist,getDirectoryContents)
-import System.FilePath (takeExtension)
+import System.Environment (lookupEnv)
+import System.Exit (exitFailure)
+import System.FilePath (takeExtension,splitSearchPath)
 import System.IO (hPrint, hPutStrLn, stderr)
 
 data CGOptions = CGOptions
@@ -25,6 +30,7 @@ data CGOptions = CGOptions
   , optOutput :: Maybe FilePath
   , optRoot   :: Maybe GenerationRoot
   , optTarget :: GenerationTarget
+  , optCryptolPathOnly :: Bool
   } deriving (Show)
 
 argParser :: ArgParser CGOptions
@@ -35,6 +41,7 @@ argParser = ArgParser
     , optOutput = Nothing
     , optRoot   = Nothing
     , optTarget = SBVC
+    , optCryptolPathOnly = False
     }
   , description = defaultDescription
     [ Option "o" ["output-dir"] (ReqArg setOutput "DIR")
@@ -45,6 +52,9 @@ argParser = ArgParser
 
     , Option "t" ["target"] (ReqArg setTarget "BACKEND")
       "code generation backend (default SBV-C)"
+
+    , Option ""  ["cryptolpath-only"] (NoArg setCryptolPathOnly)
+      "only look for .cry files in CRYPTOLPATH; don't use built-in locations"
     ]
   , toolName = "Cryptol Code Generator"
   }
@@ -72,21 +82,45 @@ setTarget target = case fromString target of
   Nothing -> report $ "Unknown backend " ++ target ++
                       ". Choices are " ++ intercalate ", " knownTargets
 
+setCryptolPathOnly :: OptParser (Options CGOptions)
+setCryptolPathOnly  = modifyOpt $ \opts -> opts { optCryptolPathOnly = True }
+
 main :: IO ()
 main = getOpts argParser >>= codeGenFromOpts
 
 -- | Precondition: the generation root must be 'Just'.
 codeGenFromOpts :: CGOptions -> IO ()
-codeGenFromOpts CGOptions
-  { optRoot   = Just root
-  , optOutput = outDir
-  , optTarget = impl
-  , optLoad   = inFiles
-  } = do
-  -- } = case inFiles of
-  -- [f] -> do
-    codeGen outDir root impl
-    -- env <- initialModuleEnv
-    -- (modRes, _warnings) <- loadModuleByPath f env
-    -- either (hPrint stderr . pp) (codeGen outDir root impl) modRes
-  -- _   -> hPutStrLn stderr "Must specify exactly one file to load."
+codeGenFromOpts CGOptions { .. } = inFreshEnv $
+  do mCryptolPath <- io (lookupEnv "CRYPTOLPATH")
+     let cryptolPath = case mCryptolPath of
+           Nothing -> []
+
+           Just path ->
+#if defined(mingw32_HOST_OS) || defined(__MINGW32__)
+                  -- Windows paths search from end to beginning
+                  reverse (splitSearchPath path)
+#else
+                  splitSearchPath path
+#endif
+
+     modifyModuleEnv $ \ ModuleEnv { .. } ->
+       ModuleEnv { meSearchPath = if optCryptolPathOnly
+                                     then cryptolPath
+                                     else cryptolPath ++ meSearchPath
+                 , .. }
+
+     case optRoot of
+       Just root -> codeGen optOutput root optTarget
+       Nothing   -> io $ do putStrLn "No root specified"
+                            exitFailure
+
+
+inFreshEnv :: ModuleM () -> IO ()
+inFreshEnv body =
+  do env         <- initialModuleEnv
+     (res,warns) <- runModuleM env body
+     mapM_ (print . pp) warns
+     case res of
+       Right (a,_) ->    return ()
+       Left err    -> do print (pp err)
+                         exitFailure

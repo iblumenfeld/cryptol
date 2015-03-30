@@ -15,6 +15,8 @@
 
 module CodeGen.SBVC where
 
+import CodeGen.CWord
+
 import Control.Applicative
 import Data.List (intercalate)
 import Data.Foldable (foldrM)
@@ -25,7 +27,10 @@ import qualified Data.SBV.Internals as SBV
 import qualified Data.Map as M
 
 import Cryptol.Eval (ExprOperations(..), evalDeclsGeneric, evalNewtypesGeneric)
-import Cryptol.Eval.Value (BitWord(..), GenValue(..), PPOpts(..), TValue(..), WithBase(..), defaultPPOpts)
+import Cryptol.Eval.Value
+           (BitWord(..), GenValue(..), PPOpts(..), TValue(..), WithBase(..),
+            defaultPPOpts, isTSeq, isTBit, tlam, numTValue, fromVWord, fromSeq,
+            fromVBit)
 import Cryptol.ModuleSystem (ModuleEnv(..), checkExpr, focusedEnv, initialModuleEnv)
 import Cryptol.ModuleSystem.Env (moduleDeps)
 import Cryptol.ModuleSystem.Monad (runModuleM, ModuleM, getModuleEnv, io)
@@ -35,6 +40,7 @@ import Cryptol.Parser (parseExpr)
 import Cryptol.Parser.Position (Range, emptyRange)
 import Cryptol.Prims.Eval (BinOp, UnOp)
 import Cryptol.Prims.Syntax
+import Cryptol.Symbolic.Prims (replicateV)
 import Cryptol.Symbolic.Value () -- for its instance Mergeable (GenValue b w)
 import Cryptol.TypeCheck.AST
            (ModName(..), QName(..), Name(..), TVar, Expr, Type(..), Schema(..),
@@ -42,6 +48,7 @@ import Cryptol.TypeCheck.AST
             groupDecls)
 import Cryptol.TypeCheck.Defaulting (defaultExpr)
 import Cryptol.TypeCheck.Subst (apSubst)
+import Cryptol.TypeCheck.Solver.InfNat (Nat'(..))
 import Cryptol.Utils.Compare
 import Cryptol.Utils.Panic
 import Cryptol.Utils.PP (PP(..), Doc, braces, brackets, char, comma, fsep, parens, pp, pretty, punctuate, sep, text)
@@ -55,132 +62,12 @@ import qualified Cryptol.Utils.PP   as PP
 
 import qualified CodeGen.Types as T
 
-
--- CWord -----------------------------------------------------------------------
-
--- A type of words with statically-known bit sizes.
-data CWord
-  = CWord8  SWord8
-  | CWord16 SWord16
-  | CWord32 SWord32
-  | CWord64 SWord64
-  | UnsupportedSize Int
-
-instance BitWord SBool CWord where
-  packWord bs = case length bs of
-    8  -> CWord8  $ fromBitsBE bs
-    16 -> CWord16 $ fromBitsBE bs
-    32 -> CWord32 $ fromBitsBE bs
-    64 -> CWord64 $ fromBitsBE bs
-    n  -> UnsupportedSize n
-  unpackWord cw = case cw of
-    CWord8  w -> blastBE w
-    CWord16 w -> blastBE w
-    CWord32 w -> blastBE w
-    CWord64 w -> blastBE w
-    UnsupportedSize n -> panic "CodeGen.SBVC.unpackWord @SBool @CWord"
-      [ "Words of width " ++ show n ++ " are not supported." ]
-
-instance Comparable CWord OrderingSymbolic where
-  cmp (CWord8  l) (CWord8  r) = cmp l r
-  cmp (CWord16 l) (CWord16 r) = cmp l r
-  cmp (CWord32 l) (CWord32 r) = cmp l r
-  cmp (CWord64 l) (CWord64 r) = cmp l r
-  cmp l r
-    | cWidth l == cWidth r = panic "CodeGen.SBVC.cmp @CWord"
-      [ "Can't compare words of unsupported size " ++ show (cWidth l) ]
-    | otherwise = panic "CodeGen.SBVC.cmp @CWord"
-      [ "Can't compare words of differing sizes:"
-      , show (cWidth l)
-      , show (cWidth r)
-      ]
-
-mkCWord :: Integer -> Integer -> CWord
-mkCWord width value = case width of
-  8  -> CWord8  $ fromInteger value
-  16 -> CWord16 $ fromInteger value
-  32 -> CWord32 $ fromInteger value
-  64 -> CWord64 $ fromInteger value
-  _  -> UnsupportedSize $ fromInteger width
-
-cWidth :: CWord -> Int
-cWidth CWord8 {} = 8
-cWidth CWord16{} = 16
-cWidth CWord32{} = 32
-cWidth CWord64{} = 64
-cWidth (UnsupportedSize n) = n
-
-liftUnCWord
-  :: UnOp SWord8
-  -> UnOp SWord16
-  -> UnOp SWord32
-  -> UnOp SWord64
-  -> Integer -> UnOp CWord
-liftUnCWord op8 op16 op32 op64 _ cw = case cw of
-  CWord8  w -> CWord8  (op8  w)
-  CWord16 w -> CWord16 (op16 w)
-  CWord32 w -> CWord32 (op32 w)
-  CWord64 w -> CWord64 (op64 w)
-  _ -> cw
-
-liftBinCWord
-  :: BinOp SWord8
-  -> BinOp SWord16
-  -> BinOp SWord32
-  -> BinOp SWord64
-  -> Integer -> BinOp CWord
-liftBinCWord op8 op16 op32 op64 _ cl cr = case (cl, cr) of
-  (CWord8  l, CWord8  r) -> CWord8  (op8  l r)
-  (CWord16 l, CWord16 r) -> CWord16 (op16 l r)
-  (CWord32 l, CWord32 r) -> CWord32 (op32 l r)
-  (CWord64 l, CWord64 r) -> CWord64 (op64 l r)
-  (UnsupportedSize l, UnsupportedSize r) | l == r -> UnsupportedSize l
-  _ -> panic "CodeGen.SBVC.liftBinCWord"
-    [ "size mismatch"
-    , show (cWidth cl)
-    , show (cWidth cr)
-    ]
-
--- | All the classes supported by the kinds of words contained in a 'CWord'.
--- Commented-out contexts are ones which we could support but don't for now
--- because we aren't using them yet and don't want to spuriously add imports.
-type SBVWord a =
-  ( SDivisible a
-  , FromBits a
-  , Polynomial a
-  , Bounded a
-  , Enum a
-  , Eq a
-  , Num a
-  , Show a
-  -- , Arbitrary a
-  , Bits a
-  -- , NFData a
-  -- , Random a
-  , SExecutable a
-  , Data.SBV.HasKind a
-  , PrettyNum a
-  , Uninterpreted a
-  , Mergeable a
-  , OrdSymbolic a
-  , EqSymbolic a
-  )
-
-liftBinSBVWord :: (forall a. SBVWord a => BinOp a) -> Integer -> BinOp CWord
-liftBinSBVWord op = liftBinCWord op op op op
-
-liftUnSBVWord :: (forall a. SBVWord a => UnOp a) -> Integer -> UnOp CWord
-liftUnSBVWord op = liftUnCWord op op op op
-
-instance Mergeable CWord where
-  symbolicMerge b sb = liftBinSBVWord
-    (symbolicMerge b sb)
-    (panic "CodeGen.SBVC.symbolicMerge @CWord" ["unused size argument was unexpectedly inspected"])
+import Cryptol.Symbolic.BitVector
 
 
 -- Primitives ------------------------------------------------------------------
 
-type Value = GenValue SBool CWord
+type Value = GenValue SBool SWord
 
 -- | Extend an environment with the contents of a module.
 extEnv :: Module -> Env -> Env
@@ -198,6 +85,7 @@ evalECon :: ECon -> Value
 evalECon e = case e of
   ECTrue        -> VBit true
   ECFalse       -> VBit false
+  {-
   ECDemote      -> Eval.ecDemoteGeneric "CodeGen.SBVC.evalECon" mkCWord
   ECPlus        -> binArith "+" (+)
   ECMinus       -> binArith "-" (-)
@@ -223,9 +111,8 @@ evalECon e = case e of
   ECOr          -> Eval.binary $ Eval.pointwiseBinary (|||) (liftBinSBVWord (.|.))
   ECXor         -> Eval.binary $ Eval.pointwiseBinary (<+>) (liftBinSBVWord  xor )
   ECCompl       -> Eval.unary  $ Eval.pointwiseUnary  bnot  (liftUnSBVWord complement)
-  {-
-  ECZero        ->
-  ECShiftL      ->
+  ECZero        -> tlam zeroV
+  ECShiftL      -> -- {m,n,a} (fin n) => [m]a -> [n] -> [m]a
   ECShiftR      ->
   ECRotL        ->
   ECRotR        ->
@@ -252,18 +139,26 @@ evalECon e = case e of
   -}
   _ -> panic "CodeGen.SBVC.evalECon" ["operation not supported: " ++ show e]
 
-binArith :: String -> (forall a. SBVWord a => BinOp a) -> Value
-binArith opName op = Eval.binary $ Eval.pointwiseBinary
-  (panic "CodeGen.SBVC.evalECon"
-    ["Bits were a complete surprise when evaluating " ++ opName])
-  (liftBinSBVWord op)
+-- binArith :: String -> (forall a. SBVWord a => BinOp a) -> Value
+-- binArith opName op = Eval.binary $ Eval.pointwiseBinary
+--   (panic "CodeGen.SBVC.evalECon"
+--     ["Bits were a complete surprise when evaluating " ++ opName])
+--   (liftBinSBVWord op)
 
-unArith :: String -> (forall a. SBVWord a => UnOp a) -> Value
-unArith opName op = Eval.unary $ Eval.pointwiseUnary
-  (panic "CodeGen.SBVC.evalECon"
-    ["Bits were a complete surprise when evaluating " ++ opName])
-  (liftUnSBVWord op)
+-- unArith :: String -> (forall a. SBVWord a => UnOp a) -> Value
+-- unArith opName op = Eval.unary $ Eval.pointwiseUnary
+--   (panic "CodeGen.SBVC.evalECon"
+--     ["Bits were a complete surprise when evaluating " ++ opName])
+--   (liftUnSBVWord op)
 
+-- zeroV :: TValue -> Value
+-- zeroV ty | Just (len,a) <- isTSeq ty
+--          , Nat n        <- numTValue len
+--          , isTBit a =
+--            VWord (mkCWord n 0)
+-- zeroV ty =
+--   panic "CodeGen.SBVC.zeroV"
+--       ["unable to instantiate zero for: " ++ show ty]
 
 -- Uninterpreted Functions -----------------------------------------------------
 
@@ -296,17 +191,13 @@ bindArgs qn sig = go [] args
   go _ (ty:_) = badType ty
 
   -- TODO: allow results other than CWord8
-  go vals [] =
-    VWord $ CWord8 $ SBV.SBV kind $ Right $ SBV.cache $ \ st ->
-      do words <- mapM (toSW st) (reverse vals)
-         SBV.newExpr st kind (SBV.SBVApp (SBV.Uninterpreted (cName qn)) words)
+  go vals [] = VWord $
+    case res of
+      PWord n -> mkResult vals
 
-  toSW st (CWord8  sbv) = SBV.sbvToSW st sbv
-  toSW st (CWord16 sbv) = SBV.sbvToSW st sbv
-  toSW st (CWord32 sbv) = SBV.sbvToSW st sbv
-  toSW st (CWord64 sbv) = SBV.sbvToSW st sbv
-
-  toSW _ _ = error "bindArgs: toSW"
+  mkResult vals = SBV.SBV kind $ Right $ SBV.cache $ \ st ->
+    do words <- mapM (SBV.sbvToSW st) (reverse vals)
+       SBV.newExpr st kind (SBV.SBVApp (SBV.Uninterpreted (cName qn)) words)
 
 
 -- | Flattens a schema into the arguments, and result type.
@@ -384,7 +275,7 @@ lookupTerm n e = case lookupGlobalTerm n e of
 evalExpr :: Env -> Expr -> Value
 evalExpr = Eval.evalExprGeneric withSBVC
 
-withSBVC :: ExprOperations Env SBool CWord
+withSBVC :: ExprOperations Env SBool SWord
 withSBVC = ExprOperations
   { eoECon       = evalECon
   , eoBindTerm   = bindLocalTerm
@@ -400,32 +291,14 @@ evalType :: Env -> Type -> TValue
 evalType env = Eval.evalType (mempty { Eval.envTypes = envTypes env })
 
 evalListSel :: Int -> Value -> Value
-evalListSel n (VWord cw) = VBit $ case cw of
-  CWord8  w -> sbvTestBit w n
-  CWord16 w -> sbvTestBit w n
-  CWord32 w -> sbvTestBit w n
-  CWord64 w -> sbvTestBit w n
-  UnsupportedSize w -> panic "CodeGen.SBVC.evalListSel"
-    [ "Trying to index into a word of unsupported size " ++ show w ]
+evalListSel n (VWord w) = VBit (sbvTestBit w n)
 evalListSel n (VSeq _  vs) = vs !! n
 evalListSel n (VStream vs) = vs !! n
 evalListSel _ v = panic "CodeGen.SBVC.evalListSel"
-  [ "Trying to index into a non-list value:", pretty v ]
+  [ "Trying to index into a non-list value", pretty v ]
 
 
 -- Pretty Printing -------------------------------------------------------------
-
--- TODO: use hex or WithBase instead, and reflect the bit widths visually
-instance PP CWord where
-  ppPrec _ cw = case cw of
-    CWord8  w -> ppw 8  w
-    CWord16 w -> ppw 16 w
-    CWord32 w -> ppw 32 w
-    CWord64 w -> ppw 64 w
-    UnsupportedSize n -> size n
-    where
-    size n = text $ "<[" ++ show (n :: Int) ++ "]>"
-    ppw  n = maybe (size n) (text . show) . unliteral
 
 instance PP (WithBase Value) where
   ppPrec _ (WithBase opts val) = go val where
@@ -434,7 +307,7 @@ instance PP (WithBase Value) where
       VTuple vals  -> parens   (sep (punctuate comma (map go    vals)))
       VSeq _ vals  -> brackets (sep (punctuate comma (map go    vals)))
       VBit b       -> ppSBVShow "<Bit>" b
-      VWord w      -> pp w
+      VWord w      -> text (show w)
       VStream vals -> brackets $ fsep
                                $ punctuate comma
                                ( take (useInfLength opts) (map go vals)
@@ -448,13 +321,13 @@ instance PP (WithBase Value) where
 instance PP Value where
   ppPrec n v = ppPrec n (WithBase defaultPPOpts v)
 
+ppSBVShow :: (Show a, SymWord a) => String -> SBV a -> Doc
+ppSBVShow sym = ppSBVLit (text sym) (text . show)
+
 -- | Pretty-print literals as their values, and non-literals as some default
 -- description (typically their type wrapped in angle brackets).
 ppSBVLit :: SymWord a => Doc -> (a -> Doc) -> SBV a -> Doc
 ppSBVLit sym lit expr = maybe sym lit (unliteral expr)
-
-ppSBVShow :: (Show a, SymWord a) => String -> SBV a -> Doc
-ppSBVShow sym = ppSBVLit (text sym) (text . show)
 
 
 -- Code Generation -------------------------------------------------------------
@@ -526,30 +399,29 @@ moduleToC env Module { .. } = [ mkDecl d | dg <- mDecls, d <- groupDecls dg ]
   where
   mkDecl Decl { .. } =
     case lookupLocalTerm dName env of
-      Just val -> (cName dName, valueToC val)
+      Just val -> (cName dName, valueToC dSignature val)
       Nothing  -> error ("value not in scope: " ++ show dName)
 
-valueToC :: Value -> SBVCodeGen ()
-valueToC val =
+valueToC :: Schema -> Value -> SBVCodeGen ()
+
+valueToC (Forall [] [] ty) val =
   do cgGenerateMakefile False
      cgGenerateDriver   False
-     _ <- genArgs 0 val
+     _ <- genArgs 0 ty val
      return ()
 
-genArgs :: Int -> Value -> SBVCodeGen ()
+valueToC _ _ = error "Unable to generate code for polymorphic values"
 
-genArgs ix (VFun f) =
-  do var <- cgInput ("in" ++ show ix)
 
-     -- TODO: have this type the input based on the actual expected type
-     genArgs (ix + 1) (f (VWord (CWord8 var)))
+genArgs :: Int -> Type -> Value -> SBVCodeGen ()
 
-genArgs _ (VWord (CWord8  w)) = cgReturn w
-genArgs _ (VWord (CWord16 w)) = cgReturn w
-genArgs _ (VWord (CWord32 w)) = cgReturn w
-genArgs _ (VWord (CWord64 w)) = cgReturn w
+genArgs ix (ty @ (PWord n) :-> rest) (VFun f) =
+    do arg <- SBV.cgInput' ("in" ++ show ix) (forallBV_ (fromInteger n))
+       genArgs (ix + 1) rest (f (VWord arg))
 
-genArgs _ _ =
+genArgs _ (PWord n) (VWord w) = cgReturn w
+
+genArgs _ _ _ =
      fail "unexpected value?"
 
 
